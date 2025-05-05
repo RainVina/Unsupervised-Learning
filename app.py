@@ -12,7 +12,6 @@ from datetime import datetime
 from collections import defaultdict
 import shutil
 
-# Create output directory and log file
 OUTPUT_DIR = "frequent_customers"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 LOG_FILE = os.path.join(OUTPUT_DIR, "visit_log.csv")
@@ -22,13 +21,12 @@ if not os.path.exists(LOG_FILE):
         writer = csv.writer(f)
         writer.writerow(["Label", "Timestamp"])
 
-# Parameters
 ENCODINGS = []
 FACES = []
 label_count = {}
 dbscan = DBSCAN(eps=0.5, min_samples=3)
+CLUSTER_EVERY_N_FRAMES = 30
 
-# GUI Application Class
 class FaceRecognitionApp:
     def __init__(self, root):
         self.root = root
@@ -37,30 +35,32 @@ class FaceRecognitionApp:
         self.running = False
         self.cap = None
         self.thread = None
+        self.frame_count = 0
 
         self.video_label = tk.Label(root)
         self.video_label.pack(padx=10, pady=10)
 
-        self.cooldown_seconds = tk.IntVar(value=30)  # Default cooldown
-        self.last_capture_time = {}  # Per label cooldown tracking
+        self.cooldown_seconds = tk.IntVar(value=30)
+        self.last_capture_time = {}
+        self.known_labels = set()
 
-        # Button panel
+        # Buttons
         btn_frame = ttk.Frame(root, padding=10)
         btn_frame.pack(fill=tk.X)
 
         ttk.Button(btn_frame, text="Start Camera", command=self.start_camera).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Stop Camera", command=self.stop_camera).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Show Frequent Customers", command=self.show_customers).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Show History", command=self.show_customers).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Export Report", command=self.export_report).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Reset Data", command=self.reset_data).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Exit", command=self.root.quit).pack(side=tk.RIGHT, padx=5)
 
-        # Cooldown setting
         cooldown_frame = ttk.Frame(root, padding=5)
         cooldown_frame.pack()
         ttk.Label(cooldown_frame, text="Capture Cooldown (seconds):").pack(side=tk.LEFT)
-        cooldown_menu = ttk.OptionMenu(cooldown_frame, self.cooldown_seconds, 30, 30, 15, 10, 5)
-        cooldown_menu.pack(side=tk.LEFT)
+        ttk.OptionMenu(cooldown_frame, self.cooldown_seconds, 30, 30, 15, 10, 5).pack(side=tk.LEFT)
+
+        self.load_encodings()
 
     def start_camera(self):
         if self.running:
@@ -82,6 +82,13 @@ class FaceRecognitionApp:
             writer = csv.writer(f)
             writer.writerow([label, timestamp])
 
+    def load_encodings(self):
+        for label_folder in os.listdir(OUTPUT_DIR):
+            if not label_folder.startswith("customer_"):
+                continue
+            label = int(label_folder.split("_")[1])
+            self.known_labels.add(label)
+
     def video_loop(self):
         while self.running and self.cap.isOpened():
             ret, frame = self.cap.read()
@@ -96,28 +103,30 @@ class FaceRecognitionApp:
                 ENCODINGS.append(enc)
                 FACES.append((frame.copy(), loc))
 
-                if len(ENCODINGS) % 10 == 0:
-                    labels = dbscan.fit_predict(ENCODINGS)
-                    for i, label in enumerate(labels):
-                        if label == -1:
-                            continue
+            self.frame_count += 1
+            if len(ENCODINGS) >= 10 and self.frame_count % CLUSTER_EVERY_N_FRAMES == 0:
+                labels = dbscan.fit_predict(ENCODINGS)
+                for i, label in enumerate(labels):
+                    if label == -1:
+                        continue
+                    now = datetime.now()
+                    last_time = self.last_capture_time.get(label)
+                    cooldown = self.cooldown_seconds.get()
+
+                    if not last_time or (now - last_time).total_seconds() >= cooldown:
                         label_count[label] = label_count.get(label, 0) + 1
+                        self.known_labels.add(label)
 
-                        now = datetime.now()
-                        last_time = self.last_capture_time.get(label)
-                        cooldown = self.cooldown_seconds.get()
-
-                        if not last_time or (now - last_time).total_seconds() >= cooldown:
-                            img, loc = FACES[i]
-                            top, right, bottom, left = loc
-                            crop = img[top:bottom, left:right]
-                            customer_dir = os.path.join(OUTPUT_DIR, f"customer_{label}")
-                            os.makedirs(customer_dir, exist_ok=True)
-                            timestamp = now.strftime("%Y%m%d_%H%M%S")
-                            filename = os.path.join(customer_dir, f"visit_{label}_{timestamp}.jpg")
-                            cv2.imwrite(filename, crop)
-                            self.log_visit(label)
-                            self.last_capture_time[label] = now
+                        img, loc = FACES[i]
+                        top, right, bottom, left = loc
+                        crop = img[top:bottom, left:right]
+                        customer_dir = os.path.join(OUTPUT_DIR, f"customer_{label}")
+                        os.makedirs(customer_dir, exist_ok=True)
+                        timestamp = now.strftime("%Y%m%d_%H%M%S")
+                        filename = os.path.join(customer_dir, f"visit_{label}_{timestamp}.jpg")
+                        cv2.imwrite(filename, crop)
+                        self.log_visit(label)
+                        self.last_capture_time[label] = now
 
             for top, right, bottom, left in face_locations:
                 cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
@@ -136,8 +145,10 @@ class FaceRecognitionApp:
             return
 
         popup = tk.Toplevel(self.root)
-        popup.title("Frequent Customers")
-        popup.geometry("600x500")
+        popup.title("Visit History")
+        popup.geometry("650x550")
+
+        ttk.Label(popup, text=f"Total Unique Customers: {len(self.known_labels)}", font=("Arial", 12)).pack(pady=10)
 
         canvas = tk.Canvas(popup)
         scrollbar = ttk.Scrollbar(popup, orient="vertical", command=canvas.yview)
@@ -198,6 +209,7 @@ class FaceRecognitionApp:
             FACES = []
             label_count = {}
             self.last_capture_time.clear()
+            self.known_labels.clear()
             messagebox.showinfo("Reset", "All data has been reset.")
 
 # Launch
