@@ -4,13 +4,13 @@ import numpy as np
 from sklearn.cluster import DBSCAN
 import os
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk
 import threading
 import csv
 from datetime import datetime
 from collections import defaultdict
-import time
+import shutil
 
 # Create output directory and log file
 OUTPUT_DIR = "frequent_customers"
@@ -27,8 +27,6 @@ ENCODINGS = []
 FACES = []
 label_count = {}
 dbscan = DBSCAN(eps=0.5, min_samples=3)
-last_visit_time = {}  # To store last visit time for each label
-COOLDOWN_TIME = 30  # Default cooldown in seconds
 
 # GUI Application Class
 class FaceRecognitionApp:
@@ -43,6 +41,9 @@ class FaceRecognitionApp:
         self.video_label = tk.Label(root)
         self.video_label.pack(padx=10, pady=10)
 
+        self.cooldown_seconds = tk.IntVar(value=30)  # Default cooldown
+        self.last_capture_time = {}  # Per label cooldown tracking
+
         # Button panel
         btn_frame = ttk.Frame(root, padding=10)
         btn_frame.pack(fill=tk.X)
@@ -50,20 +51,16 @@ class FaceRecognitionApp:
         ttk.Button(btn_frame, text="Start Camera", command=self.start_camera).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Stop Camera", command=self.stop_camera).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Show Frequent Customers", command=self.show_customers).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Export Report", command=self.export_report).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Reset Data", command=self.reset_data).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Exit", command=self.root.quit).pack(side=tk.RIGHT, padx=5)
 
-        # Cooldown control
-        self.cooldown_label = ttk.Label(root, text="Cooldown (seconds):")
-        self.cooldown_label.pack(pady=5)
-        self.cooldown_slider = ttk.Scale(root, from_=10, to_=60, orient="horizontal", length=300)
-        self.cooldown_slider.set(COOLDOWN_TIME)
-        self.cooldown_slider.pack(pady=5)
-
-        self.cooldown_checkbox_var = tk.BooleanVar(value=True)
-        self.cooldown_checkbox = ttk.Checkbutton(
-            root, text="Enable Cooldown", variable=self.cooldown_checkbox_var
-        )
-        self.cooldown_checkbox.pack(pady=5)
+        # Cooldown setting
+        cooldown_frame = ttk.Frame(root, padding=5)
+        cooldown_frame.pack()
+        ttk.Label(cooldown_frame, text="Capture Cooldown (seconds):").pack(side=tk.LEFT)
+        cooldown_menu = ttk.OptionMenu(cooldown_frame, self.cooldown_seconds, 30, 30, 15, 10, 5)
+        cooldown_menu.pack(side=tk.LEFT)
 
     def start_camera(self):
         if self.running:
@@ -99,16 +96,28 @@ class FaceRecognitionApp:
                 ENCODINGS.append(enc)
                 FACES.append((frame.copy(), loc))
 
-                # If the cooldown is enabled
-                if self.cooldown_checkbox_var.get():
-                    current_time = time.time()
-                    label = dbscan.fit_predict([enc])  # Using DBSCAN to assign labels
-                    if label == -1:
-                        continue
-                    
-                    if label not in last_visit_time or (current_time - last_visit_time[label]) >= self.cooldown_slider.get():
-                        last_visit_time[label] = current_time
-                        self.save_image(label, FACES[-1])
+                if len(ENCODINGS) % 10 == 0:
+                    labels = dbscan.fit_predict(ENCODINGS)
+                    for i, label in enumerate(labels):
+                        if label == -1:
+                            continue
+                        label_count[label] = label_count.get(label, 0) + 1
+
+                        now = datetime.now()
+                        last_time = self.last_capture_time.get(label)
+                        cooldown = self.cooldown_seconds.get()
+
+                        if not last_time or (now - last_time).total_seconds() >= cooldown:
+                            img, loc = FACES[i]
+                            top, right, bottom, left = loc
+                            crop = img[top:bottom, left:right]
+                            customer_dir = os.path.join(OUTPUT_DIR, f"customer_{label}")
+                            os.makedirs(customer_dir, exist_ok=True)
+                            timestamp = now.strftime("%Y%m%d_%H%M%S")
+                            filename = os.path.join(customer_dir, f"visit_{label}_{timestamp}.jpg")
+                            cv2.imwrite(filename, crop)
+                            self.log_visit(label)
+                            self.last_capture_time[label] = now
 
             for top, right, bottom, left in face_locations:
                 cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
@@ -121,22 +130,9 @@ class FaceRecognitionApp:
         if self.cap:
             self.cap.release()
 
-    def save_image(self, label, face_data):
-        img, loc = face_data
-        top, right, bottom, left = loc
-        crop = img[top:bottom, left:right]
-        existing = [f for f in os.listdir(OUTPUT_DIR) if f.startswith(f"customer_{label}_")]
-        next_index = len(existing)
-        folder = os.path.join(OUTPUT_DIR, f"customer_{label}")
-        os.makedirs(folder, exist_ok=True)
-        filename = os.path.join(folder, f"visit_{next_index}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
-        cv2.imwrite(filename, crop)
-        self.log_visit(label)
-
     def show_customers(self):
-        files = os.listdir(OUTPUT_DIR)
-        if not files:
-            messagebox.showinfo("Info", "No frequent customers saved yet.")
+        if not os.path.exists(LOG_FILE):
+            messagebox.showinfo("Info", "No visit log available.")
             return
 
         popup = tk.Toplevel(self.root)
@@ -155,23 +151,21 @@ class FaceRecognitionApp:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         customer_data = defaultdict(list)
-        if os.path.exists(LOG_FILE):
-            with open(LOG_FILE, "r") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    label = row["Label"]
-                    timestamp = row["Timestamp"]
-                    customer_data[label].append(timestamp)
+        with open(LOG_FILE, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                label = row["Label"]
+                timestamp = row["Timestamp"]
+                customer_data[label].append(timestamp)
 
         for label in sorted(customer_data.keys(), key=lambda x: int(x)):
-            img_path = None
-            for file in os.listdir(OUTPUT_DIR):
-                if file.startswith(f"customer_{label}_"):
-                    img_path = os.path.join(OUTPUT_DIR, file)
-                    break
-            if not img_path:
+            customer_dir = os.path.join(OUTPUT_DIR, f"customer_{label}")
+            if not os.path.exists(customer_dir):
                 continue
-
+            images = [f for f in os.listdir(customer_dir) if f.endswith(".jpg")]
+            if not images:
+                continue
+            img_path = os.path.join(customer_dir, images[0])
             img = Image.open(img_path).resize((100, 100))
             imgtk = ImageTk.PhotoImage(img)
 
@@ -182,6 +176,29 @@ class FaceRecognitionApp:
             ttk.Label(frame, text=f"Last seen: {customer_data[label][-1]}").pack()
             frame.image = imgtk
             frame.pack(side=tk.TOP, anchor="w", pady=10)
+
+    def export_report(self):
+        if not os.path.exists(LOG_FILE):
+            messagebox.showinfo("Info", "No visit log to export.")
+            return
+        save_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+        if save_path:
+            shutil.copy(LOG_FILE, save_path)
+            messagebox.showinfo("Success", f"Report saved to {save_path}")
+
+    def reset_data(self):
+        if messagebox.askyesno("Confirm", "Are you sure you want to delete all saved data?"):
+            shutil.rmtree(OUTPUT_DIR)
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            with open(LOG_FILE, "w", newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Label", "Timestamp"])
+            global ENCODINGS, FACES, label_count
+            ENCODINGS = []
+            FACES = []
+            label_count = {}
+            self.last_capture_time.clear()
+            messagebox.showinfo("Reset", "All data has been reset.")
 
 # Launch
 if __name__ == "__main__":
